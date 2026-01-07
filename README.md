@@ -1,7 +1,7 @@
 # micro-ugens
 
 Microsound UGens for SuperCollider.
-(c) 2026 by Luc Doebereiner
+Copyright (c) 2026 Luc Döbereiner
 luc.doebereiner@gmail.com
 
 ## UGens
@@ -19,7 +19,7 @@ luc.doebereiner@gmail.com
 ## Building
 
 ```bash
-git clone https://github.com/yourname/micro-ugens.git
+git clone https://github.com/lucdoebereiner/micro-ugen.git
 cd micro-ugens
 mkdir build && cd build
 cmake -DSC_PATH=/path/to/supercollider ..
@@ -28,10 +28,6 @@ make install
 ```
 
 Set `SC_PATH` to your SuperCollider source directory, or set the `SC_PATH` environment variable.
-
-### Options
-
-- `-DSUPERNOVA=ON` — Build for supernova server
 
 ### Install locations
 
