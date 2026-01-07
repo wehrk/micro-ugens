@@ -1,0 +1,484 @@
+CLASS:: Pulsar
+SUMMARY:: Pulsar synthesis with polynomial pulsaret shapes and phase coupling
+CATEGORIES:: UGens>Generators>Deterministic
+RELATED:: Classes/Blip, Classes/Formant, Classes/SyncSaw, Classes/VOsc
+
+DESCRIPTION::
+Pulsar implements pulsar synthesis with micro-level synchronization capabilities. Each pulsaret consists of a polynomial envelope code::t^a * (1-t)^b:: modulating a sine carrier.
+
+STRONG::Key Features:::
+LIST::
+## Polynomial pulsaret envelope with shape control
+## Formant control via carrier frequency ratio
+## Three synchronization modes: Kuramoto coupling, hard sync, soft sync
+## Multiple sync phase inputs for true Kuramoto coupling
+## Phase output for coupling multiple oscillators
+## Polyphonic pulsarets (width > 1 creates overlaps)
+## All parameters modulatable at audio rate
+::
+
+SUBSECTION:: Outputs
+
+Pulsar is a MultiOutUGen with two outputs:
+LIST::
+## code::out[0]:: - Audio signal
+## code::out[1]:: - Current phase [0-1] for coupling to other oscillators
+::
+
+SUBSECTION:: Pulsaret Shape
+
+The envelope is code::t^a * (1-t)^b:: where t goes from 0 to 1 over the pulsaret duration.
+LIST::
+## Peak position = a/(a+b)
+## Lower values = narrower peak = brighter spectrum
+## shapeA controls attack, shapeB controls decay
+::
+
+SUBSECTION:: Synchronization Modes
+
+TABLE::
+## strong::Mode:: || strong::Value:: || strong::Description::
+## Kuramoto || 0 || Computes (K/N) * Σ sin(θ_j - θ_self) for all input phases
+## Hard Sync || 1 || Reset phase on first input's wrap (classic sync oscillator)
+## Soft Sync || 2 || Reset only if phase > threshold (uses first input only)
+::
+
+SUBSECTION:: Kuramoto Coupling
+
+When syncMode is 0, the phase evolves according to the Kuramoto model:
+
+code::
+dθ/dt = ω + (K/N) * Σ_j sin(θ_j - θ)
+::
+
+The UGen computes the sum of pairwise coupling terms internally when given multiple sync inputs. 
+
+SUBSECTION:: Kuramoto Chaos Regimes
+
+The Kuramoto mode has nonlinear terms that activate at higher coupling strengths:
+LIST::
+## |K| < 0.5: Simple sinusoidal coupling, stable sync/anti-sync
+## |K| > 0.5: Second harmonic term, more complex attraction basins
+## |K| > 1.0: Cubic term and third harmonic, chaos possible
+## |K| > 1.5: Self-modulation term, rich chaotic dynamics
+::
+
+
+CLASSMETHODS::
+
+METHOD:: ar
+
+ARGUMENT:: freq
+Pulsar train frequency in Hz. Default: 100.
+
+ARGUMENT:: formantRatio
+Ratio of formant frequency to fundamental. Default: 1.
+
+ARGUMENT:: width
+Duty cycle [0-2]. Values > 1 create overlapping pulsarets. Default: 0.5.
+
+ARGUMENT:: shapeA
+Attack shape exponent [0.1-10]. Default: 2.
+
+ARGUMENT:: shapeB
+Decay shape exponent [0.1-10]. Default: 2.
+
+ARGUMENT:: mask
+Gate signal. When < 0.5 at pulsaret trigger, that pulsaret is silenced. Default: 1.
+
+ARGUMENT:: syncPhases
+Phase input(s) from other oscillators [0-1]. Can be a single value or an array of phases. For Kuramoto mode, all phases contribute to the coupling sum. For hard/soft sync, only the first input is used for edge detection. Default: #[0].
+
+ARGUMENT:: syncStrength
+Coupling strength. Values > 1 enable chaotic dynamics. Default: 0.
+
+ARGUMENT:: syncMode
+Sync mode: 0=Kuramoto, 1=hard, 2=soft. Default: 0.
+
+ARGUMENT:: syncThreshold
+For soft sync, phase threshold [0-1]. Default: 0.5.
+
+ARGUMENT:: phase
+Initial phase [0-1]. Only read at instantiation. Default: 0.
+
+ARGUMENT:: maxPulsarets
+Maximum simultaneous pulsarets [1-16]. Default: 4.
+
+
+EXAMPLES::
+
+SUBSECTION:: Basic Usage
+
+code::
+// Simple pulsar - index [0] for audio
+{ Pulsar.ar(100, 4, 0.5)[0] * 0.3 }.play;
+
+// Modulated formant ratio
+{ Pulsar.ar(80, SinOsc.kr(0.2).range(2, 12), 0.4)[0] * 0.3 }.play;
+
+// Percussive shape (fast attack, slow decay)
+{ Pulsar.ar(60, 6, 0.6, shapeA: 1, shapeB: 5)[0] * 0.3 }.play;
+
+// Overlapping pulsarets (width > 1)
+{ Pulsar.ar(40, 8, 1.5, shapeA: 3, shapeB: 3)[0] * 0.3 }.play;
+::
+
+
+SUBSECTION:: Masking (Rhythmic Gating)
+
+code::
+// Pulse masking creates rhythmic patterns
+(
+{
+    var mask = LFPulse.ar(4, 0, 0.6);
+    Pulsar.ar(200, 5, 0.4, mask: mask)[0] * 0.3
+}.play;
+)
+
+// Probabilistic masking
+(
+{
+    var trig = Impulse.ar(100);
+    var mask = TRand.ar(0, 1, trig) > 0.3;
+    Pulsar.ar(100, 4, 0.5, mask: mask)[0] * 0.3
+}.play;
+)
+::
+
+
+SUBSECTION:: Two Coupled Oscillators
+
+code::
+// Bidirectional Kuramoto coupling using LocalIn/LocalOut
+// Each oscillator receives the other's phase as syncPhases
+(
+{
+    var phases = LocalIn.ar(2);
+    var coupling = MouseX.kr(0, 0.5);
+    
+    var p1 = Pulsar.ar(
+        freq: 100,
+        formantRatio: 4,
+        width: 0.4,
+        syncPhases: phases[1],  // single phase input
+        syncStrength: coupling
+    );
+    
+    var p2 = Pulsar.ar(
+        freq: 103,
+        formantRatio: 4,
+        width: 0.4,
+        syncPhases: phases[0],
+        syncStrength: coupling,
+        phase: 0.5
+    );
+    
+    LocalOut.ar([p1[1], p2[1]]);
+    [p1[0], p2[0]] * 0.2
+}.play;
+)
+
+// Negative coupling - phases repel toward anti-phase
+(
+{
+    var phases = LocalIn.ar(2);
+    var coupling = MouseX.kr(0, -0.5);
+    
+    var p1 = Pulsar.ar(100, 4, 0.4, syncPhases: phases[1], syncStrength: coupling);
+    var p2 = Pulsar.ar(100, 4, 0.4, syncPhases: phases[0], syncStrength: coupling, phase: 0.1);
+    
+    LocalOut.ar([p1[1], p2[1]]);
+    [p1[0], p2[0]] * 0.2
+}.play;
+)
+::
+
+
+SUBSECTION:: N-Oscillator Kuramoto Network (Multiple Sync Inputs)
+
+code::
+// 6 coupled oscillators - each receives ALL OTHER phases as an array
+// The UGen internally computes Σ sin(θ_j - θ_self)
+(
+{
+    var n = 6;
+    var freqs = Array.fill(n, { exprand(95, 105) });
+    var phases = LocalIn.ar(n);
+    var coupling = MouseX.kr(0, 0.4);
+    
+    var pulsars = n.collect { |i|
+        // Collect all OTHER phases (exclude self)
+        var otherPhases = (0..n-1).reject(_ == i).collect { |j| phases[j] };
+        
+        Pulsar.ar(
+            freq: freqs[i],
+            formantRatio: 5,
+            width: 0.4,
+            syncPhases: otherPhases,  // array of phases!
+            syncStrength: coupling,
+            phase: i / n
+        )
+    };
+    
+    LocalOut.ar(pulsars.collect(_[1]));
+    Splay.ar(pulsars.collect(_[0])) * 0.15
+}.play;
+)
+
+// 8 oscillators with spread frequencies
+(
+{
+    var n = 8;
+    var freqs = Array.fill(n, { exprand(80, 120) });
+    var phases = LocalIn.ar(n);
+    var coupling = MouseX.kr(0, 0.5);
+    
+    var pulsars = n.collect { |i|
+        var otherPhases = (0..n-1).reject(_ == i).collect { |j| phases[j] };
+        
+        Pulsar.ar(
+            freq: freqs[i],
+            formantRatio: LFDNoise1.kr(0.1).range(3, 8),
+            width: 0.4,
+            syncPhases: otherPhases,
+            syncStrength: coupling,
+            phase: i / n
+        )
+    };
+    
+    LocalOut.ar(pulsars.collect(_[1]));
+    Splay.ar(pulsars.collect(_[0])) * 0.12
+}.play;
+)
+::
+
+
+SUBSECTION:: Nearest-Neighbor Coupling (Ring Topology)
+
+code::
+// Each oscillator couples only to its neighbors
+(
+{
+    var n = 8;
+    var freqs = Array.fill(n, { exprand(90, 110) });
+    var phases = LocalIn.ar(n);
+    var coupling = MouseX.kr(0, 0.6);
+    
+    var pulsars = n.collect { |i|
+        // Only couple to immediate neighbors (ring)
+        var neighborPhases = [phases.wrapAt(i - 1), phases.wrapAt(i + 1)];
+        
+        Pulsar.ar(
+            freq: freqs[i],
+            formantRatio: 4,
+            width: 0.45,
+            syncPhases: neighborPhases,
+            syncStrength: coupling,
+            phase: i / n
+        )
+    };
+    
+    LocalOut.ar(pulsars.collect(_[1]));
+    Splay.ar(pulsars.collect(_[0])) * 0.12
+}.play;
+)
+::
+
+
+SUBSECTION:: Hard Sync
+
+code::
+// Classic hard sync sweep
+(
+{
+    var master = Pulsar.ar(100, 1, 0.5);
+    var slaveFreq = MouseX.kr(100, 800, 1);
+    
+    var slave = Pulsar.ar(
+        freq: slaveFreq,
+        formantRatio: 1,
+        width: 0.5,
+        syncPhases: master[1],
+        syncMode: 1  // hard sync
+    );
+    
+    slave[0] * 0.3
+}.play;
+)
+
+// Modulated hard sync
+(
+{
+    var master = Pulsar.ar(80, 2, 0.4, shapeA: 1, shapeB: 3);
+    var slaveFreq = LFNoise1.kr(0.3).exprange(150, 600);
+    
+    var slave = Pulsar.ar(
+        freq: slaveFreq,
+        formantRatio: 3,
+        width: 0.5,
+        shapeA: 2,
+        shapeB: 4,
+        syncPhases: master[1],
+        syncMode: 1
+    );
+    
+    slave[0] * 0.3
+}.play;
+)
+::
+
+
+SUBSECTION:: Soft Sync
+
+code::
+// Soft sync - threshold controls how often sync occurs
+(
+{
+    var master = Pulsar.ar(100, 1, 0.5);
+    var threshold = MouseY.kr(0.1, 0.9);
+    
+    var slave = Pulsar.ar(
+        freq: 310,
+        formantRatio: 3,
+        width: 0.4,
+        syncPhases: master[1],
+        syncMode: 2,
+        syncThreshold: threshold
+    );
+    
+    slave[0] * 0.3
+}.play;
+)
+::
+
+
+SUBSECTION:: Chaotic Dynamics (syncStrength > 1)
+
+code::
+// Two oscillators - overcoupling creates chaos
+(
+{
+    var phases = LocalIn.ar(2);
+    var coupling = MouseX.kr(0, 3);  // past 1.0 = chaos
+    
+    var p1 = Pulsar.ar(100, 4, 0.4, syncPhases: phases[1], syncStrength: coupling);
+    var p2 = Pulsar.ar(100, 4, 0.4, syncPhases: phases[0], syncStrength: coupling, phase: 0.5);
+    
+    LocalOut.ar([p1[1], p2[1]]);
+    [p1[0], p2[0]] * 0.2
+}.play;
+)
+
+// N oscillators with overcoupling - all-to-all creates complex dynamics
+(
+{
+    var n = 6;
+    var freqs = 100 ! n;  // same frequency - chaos from coupling alone
+    var phases = LocalIn.ar(n);
+    var coupling = MouseX.kr(0, 2.5);
+    
+    var pulsars = n.collect { |i|
+        var otherPhases = (0..n-1).reject(_ == i).collect { |j| phases[j] };
+        
+        Pulsar.ar(
+            freq: freqs[i],
+            formantRatio: 5,
+            width: 0.4,
+            syncPhases: otherPhases,
+            syncStrength: coupling,
+            phase: i / n
+        )
+    };
+    
+    LocalOut.ar(pulsars.collect(_[1]));
+    Splay.ar(pulsars.collect(_[0])) * 0.12
+}.play;
+)
+
+// Chaotic network with delays
+(
+{
+    var n = 6;
+    var freqs = Array.exprand(n, 50, 200);
+    var phases = LocalIn.ar(n);
+    
+    var delayedPhases = phases.collect { |p|
+        DelayC.ar(p, 0.1, LFDNoise1.ar(0.5).range(0.005, 0.03))
+    };
+    
+    var pulsars = n.collect { |i|
+        // Couple to multiple delayed neighbors
+        var syncInputs = [
+            delayedPhases.wrapAt(i + 1),
+            delayedPhases.wrapAt(i + 2),
+            delayedPhases.wrapAt(i - 1)
+        ];
+        
+        Pulsar.ar(
+            freq: freqs[i] * LFDNoise1.ar(0.2).range(0.97, 1.03),
+            formantRatio: LFDNoise1.ar(0.15).range(2, 8),
+            width: LFDNoise1.ar(0.1).range(0.4, 1.6),
+            shapeA: LFDNoise1.ar(0.12).exprange(0.3, 5),
+            shapeB: LFDNoise1.ar(0.1).exprange(0.3, 4),
+            syncPhases: syncInputs,
+            syncStrength: LFDNoise1.ar(0.2).range(1.3, 2.5),
+            phase: i / n
+        )
+    };
+    
+    LocalOut.ar(pulsars.collect(_[1]));
+    Splay.ar(pulsars.collect(_[0])) * 0.15
+}.play;
+)
+::
+
+
+SUBSECTION:: Phase as Modulation Source
+
+code::
+// Phase modulates formant of another Pulsar
+(
+{
+    var p1 = Pulsar.ar(60, 4, 0.5);
+    var p2 = Pulsar.ar(
+        freq: 120,
+        formantRatio: p1[1].linlin(0, 1, 2, 12),
+        width: 0.4
+    );
+    [p1[0], p2[0]] * 0.2
+}.play;
+)
+
+// Phase controls stereo position
+(
+{
+    var sig = Pulsar.ar(80, 6, 0.5);
+    var pan = sig[1] * 2 - 1;
+    Pan2.ar(sig[0], pan) * 0.3
+}.play;
+)
+::
+
+
+SUBSECTION:: Multichannel Expansion
+
+code::
+// Array of frequencies
+(
+{
+    var freqs = [100, 150, 200, 250];
+    var sig = Pulsar.ar(freqs, 4, 0.4);
+    Splay.ar(sig.collect(_[0])) * 0.15
+}.play;
+)
+
+// Detuned unison
+(
+{
+    var detune = [0.99, 0.997, 1, 1.003, 1.01];
+    var sig = Pulsar.ar(100 * detune, 5, 0.45);
+    Splay.ar(sig.collect(_[0])) * 0.12
+}.play;
+)
+::
+
