@@ -19,7 +19,7 @@ luc.doebereiner@gmail.com
 ## Building
 
 ```bash
-git clone https://github.com/lucdoebereiner/micro-ugen.git
+git clone https://github.com/lucdoebereiner/micro-ugens.git
 cd micro-ugens
 mkdir build && cd build
 cmake -DSC_PATH=/path/to/supercollider ..
