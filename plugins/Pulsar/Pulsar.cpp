@@ -85,23 +85,17 @@ struct Pulsaret {
     double formantRatio;    // cached formant ratio
     double shapeA;          // cached shape
     double shapeB;
+    double invPeakVal;      // 1 / peak of t^a * (1-t)^b (cached at trigger)
 };
 
 // ============================================================
-// Polynomial pulsaret envelope
+// Polynomial pulsaret envelope (peak is pre-normalized by caller)
 // ============================================================
 
-static inline double computeEnvelope(double t, double a, double b) {
+static inline double computeEnvelope(double t, double a, double b, double invPeakVal) {
     if (t <= 0.0 || t >= 1.0) return 0.0;
-    
-    // Peak of t^a * (1-t)^b is at t = a/(a+b)
-    double peakT = a / (a + b);
-    double peakVal = std::pow(peakT, a) * std::pow(1.0 - peakT, b);
-    
-    if (peakVal < 1e-12) return 0.0;
-    
     double raw = std::pow(t, a) * std::pow(1.0 - t, b);
-    return raw / peakVal;
+    return raw * invPeakVal;
 }
 
 // ============================================================
@@ -186,22 +180,46 @@ static int findFreePulsaret(Pulsar *unit) {
 // Trigger new pulsaret
 // ============================================================
 
-static void triggerPulsaret(Pulsar *unit, double width, double formantRatio, 
-                            double shapeA, double shapeB, double freq) {
+static void triggerPulsaret(Pulsar *unit, double width, double formantRatio,
+                            double shapeA, double shapeB, double freq,
+                            double subsampleOffset) {
     int idx = findFreePulsaret(unit);
     Pulsaret *p = &unit->m_pulsarets[idx];
-    
+
     p->active = true;
-    p->phase = 0.0;
-    
+
     // Pulsaret completes when phase reaches 1
     // Duration = width / freq seconds
     // phaseInc = 1 / (duration * sampleRate) = freq / (width * sampleRate)
     p->phaseInc = freq / (width * unit->m_sampleRate);
-    
+
+    // Subsample-accurate start: pulsaret was triggered subsampleOffset samples
+    // before the next processing step. At its first processed sample it should
+    // already be subsampleOffset * phaseInc into the envelope.
+    double startPhase = subsampleOffset * p->phaseInc;
+    if (startPhase < 0.0) startPhase = 0.0;
+    if (startPhase > 0.999) startPhase = 0.999;
+    p->phase = startPhase;
+
+    // Anti-alias the carrier: pulsaret carrier frequency is
+    // freq * formantRatio / width (phase advances at freq/(width*SR) per
+    // sample, carrier is sin(2π·phase·formantRatio)). Clamp formantRatio so
+    // the carrier stays below 0.49 * SR.
+    double carrierHz = freq * formantRatio / width;
+    double nyquistLimit = unit->m_sampleRate * 0.49;
+    if (carrierHz > nyquistLimit && freq > 1e-9) {
+        formantRatio = nyquistLimit * width / freq;
+        if (formantRatio < 0.125) formantRatio = 0.125;
+    }
+
     p->formantRatio = formantRatio;
     p->shapeA = shapeA;
     p->shapeB = shapeB;
+
+    // Cache the envelope peak normalization
+    double peakT = shapeA / (shapeA + shapeB);
+    double peakVal = std::pow(peakT, shapeA) * std::pow(1.0 - peakT, shapeB);
+    p->invPeakVal = (peakVal > 1e-12) ? (1.0 / peakVal) : 0.0;
 }
 
 // ============================================================
@@ -340,22 +358,31 @@ void Pulsar_next(Pulsar *unit, int nSamples) {
             
             phaseInc += couplingInc;
         }
-        else if (syncModeInt == 1) {
-            // Hard sync - uses first sync input only
+        else if (syncModeInt == 1 || syncModeInt == 2) {
+            // Hard/soft sync - uses first sync input only
             if (prevSyncPhase > 0.8f && firstSyncPhase < 0.2f) {
-                phase = 0.0;
-                if (mask >= 0.5f) {
-                    triggerPulsaret(unit, width, formantRatio, shapeA, shapeB, freq);
+                // Master wrapped between samples i-1 and i. Linearly interpolate
+                // across the wrap (dSync is the wrap-corrected phase delta) to
+                // find how far into the current sample the wrap occurred.
+                double dSync = (double)firstSyncPhase + 1.0 - (double)prevSyncPhase;
+                double subOff = 0.5;
+                if (dSync > 1e-9) {
+                    double fracToWrap = (1.0 - (double)prevSyncPhase) / dSync;
+                    subOff = 1.0 - fracToWrap;
+                    if (subOff < 0.0) subOff = 0.0;
+                    if (subOff > 1.0) subOff = 1.0;
                 }
-            }
-        }
-        else if (syncModeInt == 2) {
-            // Soft sync - uses first sync input only
-            if (prevSyncPhase > 0.8f && firstSyncPhase < 0.2f) {
-                if (phase > (double)syncThreshold) {
-                    phase = 0.0;
+
+                bool doSync = (syncModeInt == 1) ||
+                              (syncModeInt == 2 && phase > (double)syncThreshold);
+
+                if (doSync) {
+                    // Own phase should equal subOff * phaseInc at this sample
+                    // (as if reset subOff samples ago).
+                    phase = subOff * phaseInc;
                     if (mask >= 0.5f) {
-                        triggerPulsaret(unit, width, formantRatio, shapeA, shapeB, freq);
+                        triggerPulsaret(unit, width, formantRatio, shapeA, shapeB,
+                                        freq, subOff);
                     }
                 }
             }
@@ -369,36 +396,48 @@ void Pulsar_next(Pulsar *unit, int nSamples) {
         for (int p = 0; p < unit->m_maxPulsarets; ++p) {
             Pulsaret *pulsaret = &unit->m_pulsarets[p];
             if (!pulsaret->active) continue;
-            
-            // Compute envelope
-            double env = computeEnvelope(pulsaret->phase, pulsaret->shapeA, pulsaret->shapeB);
-            
+
+            // Compute envelope (peak normalization cached at trigger)
+            double env = computeEnvelope(pulsaret->phase, pulsaret->shapeA,
+                                         pulsaret->shapeB, pulsaret->invPeakVal);
+
             // Compute carrier
             double carrier = std::sin(TWOPI * pulsaret->phase * pulsaret->formantRatio);
-            
+
             sample += env * carrier;
-            
+
             // Advance pulsaret phase
             pulsaret->phase += pulsaret->phaseInc;
-            
+
             if (pulsaret->phase >= 1.0) {
                 pulsaret->active = false;
             }
         }
-        
+
         outAudio[i] = (float)sample;
         outPhase[i] = (float)phase;
-        
+
         // Advance main phase
         phase += phaseInc;
-        
+
         // Check for new pulsaret trigger
         if (phase >= 1.0) {
-            phase -= std::floor(phase);
-            
+            // Subsample-accurate trigger: overshoot tells us how far past the
+            // wrap we've advanced, so the new pulsaret was triggered
+            // (overshoot / phaseInc) samples ago.
+            double overshoot = phase - std::floor(phase);
+            double subOff = 0.0;
+            if (phaseInc > 1e-12) {
+                subOff = (phase - 1.0) / phaseInc;
+                if (subOff < 0.0) subOff = 0.0;
+                if (subOff > 1.0) subOff = 1.0;
+            }
+            phase = overshoot;
+
             // Trigger new pulsaret if not masked
             if (mask >= 0.5f) {
-                triggerPulsaret(unit, width, formantRatio, shapeA, shapeB, freq);
+                triggerPulsaret(unit, width, formantRatio, shapeA, shapeB,
+                                freq, subOff);
             }
         }
         else if (phase < 0.0) {
