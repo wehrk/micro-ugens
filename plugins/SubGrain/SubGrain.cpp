@@ -69,9 +69,17 @@ struct Grain {
     
     double bufferStart;     // starting position in buffer (samples)
     double delayStart;      // starting delay time (samples)
-    
+
     float envShape;         // 0=percussive, 0.5=hanning, 1=reversed
-    
+
+    // Source buffer NUMBER captured at grain birth, so a buffer-number swap
+    // mid-stream only affects grains born after it — live grains finish reading
+    // the buffer they started on (no mid-grain content jump / click on a
+    // double-buffer swap). We store the number (not the data pointer) and resolve
+    // the live SndBuf each read, so an in-place re-alloc of the same buffer can't
+    // leave a grain reading freed memory. -1 = no buffer.
+    int bufnum;
+
     float* panAmps;         // pre-computed per-channel amplitudes
 };
 
@@ -97,6 +105,7 @@ struct SubGrain : public Unit {
     // Buffer cache - refreshed each block
     const float* m_bufData;
     int m_bufFrames;
+    int m_bufnum;            // current source buffer number (-1 = none/invalid); captured per grain at birth
 
     float* m_outputAccum;
     float* m_inputCache;     // block-size scratch for the audio input
@@ -478,6 +487,11 @@ static void triggerGrain(SubGrain* unit, double subsampleOffset, int sampleIndex
     position += (float)(nextRandom(unit) * 2.0 - 1.0) * posSpread;
     position = sg_clampf(position, 0.0f, 1.0f);
     
+    // Capture the source buffer NUMBER at grain birth (see Grain::bufnum). The
+    // grain reads THIS buffer for its whole life, even if the buffer-number input
+    // is swapped to a different buffer while the grain is still playing.
+    g->bufnum = unit->m_bufnum;
+
     // Convert position to buffer samples
     if (unit->m_bufFrames > 0) {
         g->bufferStart = position * (unit->m_bufFrames - 1);
@@ -605,6 +619,7 @@ void SubGrain_Ctor(SubGrain *unit) {
             g->delayStart = 0.0;
             g->bufferMix = 1.0f;
             g->envShape = 0.5f;
+            g->bufnum = -1;
             g->panAmps = unit->m_panAmpStorage + (i * unit->m_numChannels);
             for (int ch = 0; ch < unit->m_numChannels; ++ch) {
                 g->panAmps[ch] = (ch == 0) ? 1.0f : 0.0f;
@@ -700,7 +715,8 @@ void SubGrain_next(SubGrain *unit, int nSamples) {
     // Refresh buffer cache EVERY BLOCK (buffer can be reallocated)
     unit->m_bufData = nullptr;
     unit->m_bufFrames = 0;
-    
+    unit->m_bufnum = -1;
+
     float bufnum = sg_sanitize(unit->mInput[4]->mBuffer[0]);
     if (bufnum >= 0.0f) {
         uint32 bufIdx = (uint32)bufnum;
@@ -711,6 +727,7 @@ void SubGrain_next(SubGrain *unit, int nSamples) {
                 if (buf->channels == 1) {
                     unit->m_bufData = buf->data;
                     unit->m_bufFrames = buf->frames;
+                    unit->m_bufnum = (int)bufIdx;
                 } else if ((int)bufIdx != unit->m_lastWarnedBufnum) {
                     Print("SubGrain: buffer %d has %d channels; only mono "
                           "buffers are supported, ignoring.\n",
@@ -785,8 +802,20 @@ void SubGrain_next(SubGrain *unit, int nSamples) {
             Grain* grain = &unit->m_grains[g];
             if (!grain->active) continue;
             
+            // resolve the grain's captured source buffer live each sample: safe even
+            // if that buffer was re-alloc'd (in-place legacy load) or freed — we read
+            // the current valid data, never a dangling pointer.
+            const float* gBufData = nullptr;
+            int gBufFrames = 0;
+            if (grain->bufnum >= 0 && (uint32)grain->bufnum < unit->mWorld->mNumSndBufs) {
+                SndBuf* gb = unit->mWorld->mSndBufs + grain->bufnum;
+                if (gb && gb->data && gb->frames > 0 && gb->channels == 1) {
+                    gBufData = gb->data;
+                    gBufFrames = gb->frames;
+                }
+            }
             float grainSample = processGrain(unit, grain, unit->m_delayLine,
-                                             unit->m_bufData, unit->m_bufFrames,
+                                             gBufData, gBufFrames,
                                              interp);
             
             if (unit->m_outputAccum && grain->panAmps) {
