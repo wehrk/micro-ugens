@@ -159,12 +159,17 @@ static inline double sg_wrap(double x, double hi) {
     return x;
 }
 
+// Read inputs via mInBuf (the IN()/IN0() path), NEVER via mInput[i]->mBuffer:
+// supernova only sets a Wire's mBuffer for audio-rate wires — control-rate and
+// constant wires keep their value in mScalarValue and mBuffer stays null
+// (scsynth points both at valid storage, which is why the direct read only
+// crashed supernova). mInBuf is populated correctly by both servers.
 static inline float getInput(SubGrain* unit, int index, int sampleIndex) {
-    Wire* wire = unit->mInput[index];
-    if (wire->mCalcRate == calc_FullRate) {
-        return sg_sanitize(wire->mBuffer[sampleIndex]);
+    const float* in = unit->mInBuf[index];
+    if (unit->mInput[index]->mCalcRate == calc_FullRate) {
+        return sg_sanitize(in[sampleIndex]);
     } else {
-        return sg_sanitize(wire->mBuffer[0]);
+        return sg_sanitize(in[0]);
     }
 }
 
@@ -761,7 +766,7 @@ void SubGrain_next(SubGrain *unit, int nSamples) {
 
     // Cache audio input (index 3)
     bool inputIsAudio = (unit->mInput[3]->mCalcRate == calc_FullRate);
-    const float* inputBufRaw = unit->mInput[3]->mBuffer;
+    const float* inputBufRaw = unit->mInBuf[3];
     float* inputCache = unit->m_inputCache;
     if (inputIsAudio) {
         for (int i = 0; i < nSamples; ++i) {
@@ -785,7 +790,7 @@ void SubGrain_next(SubGrain *unit, int nSamples) {
     unit->m_bufFrames = 0;
     unit->m_bufnum = -1;
 
-    float bufnum = sg_sanitize(unit->mInput[4]->mBuffer[0]);
+    float bufnum = sg_sanitize(unit->mInBuf[4][0]);
     if (bufnum >= 0.0f) {
         const float* curData;
         int curFrames;
