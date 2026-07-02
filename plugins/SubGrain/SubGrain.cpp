@@ -688,6 +688,69 @@ void SubGrain_next_failed(SubGrain *unit, int nSamples) {
 // ============================================================
 // Main DSP loop
 // ============================================================
+// Per-block buffer resolution with supernova reader locks.
+//
+// scsynth runs buffer commands on the DSP thread, so raw mSndBufs reads are
+// safe there. supernova frees/re-fills buffers on a separate non-realtime
+// thread WHILE the (multiple) DSP threads run, so every SndBuf must be read
+// under its shared lock, held for as long as the data pointer is used. Each
+// buffer touched during a block is locked once on first use and released at
+// the end of SubGrain_next; the ACQUIRE/RELEASE macros compile to no-ops on
+// scsynth, so this path is shared.
+// ============================================================
+
+static const int kMaxLockedBufs = 8;
+
+struct SGBufCache {
+    int num;
+    int bufnums[kMaxLockedBufs];
+    SndBuf* bufs[kMaxLockedBufs];
+    const float* data[kMaxLockedBufs];
+    int frames[kMaxLockedBufs];
+};
+
+// Look up bufnum, locking the buffer shared on first touch this block.
+// Returns false (data null) for invalid, non-mono or vanished buffers —
+// the affected grains just read silence for this block.
+static bool sgResolveBuf(SubGrain* unit, SGBufCache* cache, int bufnum,
+                         const float** outData, int* outFrames, bool warnNonMono) {
+    *outData = nullptr;
+    *outFrames = 0;
+    if (bufnum < 0 || (uint32)bufnum >= unit->mWorld->mNumSndBufs) return false;
+    for (int k = 0; k < cache->num; ++k) {
+        if (cache->bufnums[k] == bufnum) {
+            *outData = cache->data[k];
+            *outFrames = cache->frames[k];
+            return cache->data[k] != nullptr;
+        }
+    }
+    if (cache->num >= kMaxLockedBufs) return false;
+    SndBuf* buf = unit->mWorld->mSndBufs + bufnum;
+    ACQUIRE_SNDBUF_SHARED(buf);
+    int k = cache->num++;
+    cache->bufnums[k] = bufnum;
+    cache->bufs[k] = buf;
+    cache->data[k] = nullptr;
+    cache->frames[k] = 0;
+    if (buf->data && buf->frames > 0) {
+        if (buf->channels == 1) {
+            cache->data[k] = buf->data;
+            cache->frames[k] = buf->frames;
+        } else if (warnNonMono && bufnum != unit->m_lastWarnedBufnum) {
+            Print("SubGrain: buffer %d has %d channels; only mono "
+                  "buffers are supported, ignoring.\n", bufnum, buf->channels);
+            unit->m_lastWarnedBufnum = bufnum;
+        }
+    }
+    *outData = cache->data[k];
+    *outFrames = cache->frames[k];
+    return cache->data[k] != nullptr;
+}
+
+static void sgReleaseBufs(SGBufCache* cache) {
+    for (int k = 0; k < cache->num; ++k) RELEASE_SNDBUF_SHARED(cache->bufs[k]);
+    cache->num = 0;
+}
 
 void SubGrain_next(SubGrain *unit, int nSamples) {
     // The input cache, output accumulator, and delay line are all sized to the
@@ -712,29 +775,24 @@ void SubGrain_next(SubGrain *unit, int nSamples) {
     }
     const float* input = inputCache;
     
-    // Refresh buffer cache EVERY BLOCK (buffer can be reallocated)
+    // Refresh buffer cache EVERY BLOCK (buffer can be reallocated). All SndBuf
+    // reads this block go through bufCache, which holds each touched buffer's
+    // shared lock until the end of this function (supernova; no-op on scsynth).
+    SGBufCache bufCache;
+    bufCache.num = 0;
+
     unit->m_bufData = nullptr;
     unit->m_bufFrames = 0;
     unit->m_bufnum = -1;
 
     float bufnum = sg_sanitize(unit->mInput[4]->mBuffer[0]);
     if (bufnum >= 0.0f) {
-        uint32 bufIdx = (uint32)bufnum;
-        if (bufIdx < unit->mWorld->mNumSndBufs) {
-            SndBuf* buf = unit->mWorld->mSndBufs + bufIdx;
-            if (buf && buf->data && buf->frames > 0) {
-                // MONO BUFFERS ONLY - reject multi-channel
-                if (buf->channels == 1) {
-                    unit->m_bufData = buf->data;
-                    unit->m_bufFrames = buf->frames;
-                    unit->m_bufnum = (int)bufIdx;
-                } else if ((int)bufIdx != unit->m_lastWarnedBufnum) {
-                    Print("SubGrain: buffer %d has %d channels; only mono "
-                          "buffers are supported, ignoring.\n",
-                          (int)bufIdx, buf->channels);
-                    unit->m_lastWarnedBufnum = (int)bufIdx;
-                }
-            }
+        const float* curData;
+        int curFrames;
+        if (sgResolveBuf(unit, &bufCache, (int)bufnum, &curData, &curFrames, true)) {
+            unit->m_bufData = curData;
+            unit->m_bufFrames = curFrames;
+            unit->m_bufnum = (int)bufnum;
         }
     }
     
@@ -802,18 +860,12 @@ void SubGrain_next(SubGrain *unit, int nSamples) {
             Grain* grain = &unit->m_grains[g];
             if (!grain->active) continue;
             
-            // resolve the grain's captured source buffer live each sample: safe even
+            // resolve the grain's captured source buffer through bufCache: safe even
             // if that buffer was re-alloc'd (in-place legacy load) or freed — we read
-            // the current valid data, never a dangling pointer.
-            const float* gBufData = nullptr;
-            int gBufFrames = 0;
-            if (grain->bufnum >= 0 && (uint32)grain->bufnum < unit->mWorld->mNumSndBufs) {
-                SndBuf* gb = unit->mWorld->mSndBufs + grain->bufnum;
-                if (gb && gb->data && gb->frames > 0 && gb->channels == 1) {
-                    gBufData = gb->data;
-                    gBufFrames = gb->frames;
-                }
-            }
+            // the current valid data under its shared lock, never a dangling pointer.
+            const float* gBufData;
+            int gBufFrames;
+            sgResolveBuf(unit, &bufCache, grain->bufnum, &gBufData, &gBufFrames, false);
             float grainSample = processGrain(unit, grain, unit->m_delayLine,
                                              gBufData, gBufFrames,
                                              interp);
@@ -826,6 +878,9 @@ void SubGrain_next(SubGrain *unit, int nSamples) {
         }
     }
     
+    // Done with buffer data — release the shared locks taken this block.
+    sgReleaseBufs(&bufCache);
+
     // STEP 4: Copy accumulator to outputs
     for (int i = 0; i < nSamples; ++i) {
         for (int ch = 0; ch < unit->m_numChannels; ++ch) {
